@@ -1,0 +1,312 @@
+# =====================================================================
+# K6 MANAGEIQ NETWORKING & STORAGE TEST
+# =====================================================================
+# QUESTO TEST SI CONCENTRA SU:
+# - Reti (CloudNetwork, CloudSubnet, NetworkRouter, FloatingIP)
+# - Volumi (CloudVolume, CloudVolumeSnapshot, CloudVolumeType)
+# - Security (SecurityGroup, SecurityPolicy, SecurityPolicyRule)
+# =====================================================================
+# 1. DEFINIZIONE DEL NAMESPACE
+apiVersion: v1
+kind: Namespace
+metadata:
+  name: k6-tests
+
+---
+# 2. CONFIGMAP SCRIPT K6 NETWORKING & STORAGE
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: k6-network-storage-script
+  namespace: k6-tests
+data:
+  test.js: |
+    import http from 'k6/http';
+    import { check, sleep, fail } from 'k6';
+    import { Rate, Trend } from 'k6/metrics';
+    import encoding from 'k6/encoding';
+
+    // Custom metrics
+    const errorRate = new Rate('errors');
+    const networkCheckDuration = new Trend('network_check_duration');
+    const storageCheckDuration = new Trend('storage_check_duration');
+    const securityCheckDuration = new Trend('security_check_duration');
+
+    export const options = {
+      insecureSkipTLSVerify: true,
+      stages: [
+        { duration: '30s', target: 10 },
+        { duration: '3m', target: 10 },
+        { duration: '30s', target: 0 },
+      ],
+      thresholds: {
+        'http_req_duration{expected_response:true}': ['p(95)<2000'],
+        'http_req_failed': ['rate<0.10'],
+        'errors': ['rate<0.10'],
+        'network_check_duration': ['p(95)<3000'],
+        'storage_check_duration': ['p(95)<3000'],
+        'security_check_duration': ['p(95)<3000'],
+      },
+    };
+
+    const BASE_URL = __ENV.MANAGEIQ_URL;
+    const USER = __ENV.MIQ_USER;
+    const PASS = __ENV.MIQ_PASS;
+
+    // NETWORKING & STORAGE ENDPOINTS
+    const endpoints = [
+      // === NETWORK ENDPOINTS (40% delle chiamate) ===
+      { 
+        name: 'cloud_networks', 
+        url: '/api/cloud_networks?expand=resources&attributes=id,name,ems_id,enabled,status,cloud_subnets', 
+        weight: 15,
+        category: 'network'
+      },
+      { 
+        name: 'cloud_subnets', 
+        url: '/api/cloud_subnets?expand=resources&attributes=id,name,cidr,gateway,network_protocol,cloud_network_id', 
+        weight: 10,
+        category: 'network'
+      },
+      { 
+        name: 'network_routers', 
+        url: '/api/network_routers?expand=resources&attributes=id,name,ems_id,status,cloud_subnets', 
+        weight: 8,
+        category: 'network'
+      },
+      { 
+        name: 'floating_ips', 
+        url: '/api/floating_ips?expand=resources&attributes=id,address,status,vm_id,cloud_network_id', 
+        weight: 7,
+        category: 'network'
+      },
+      
+      // === STORAGE ENDPOINTS (35% delle chiamate) ===
+      { 
+        name: 'cloud_volumes', 
+        url: '/api/cloud_volumes?expand=resources&attributes=id,name,size,status,volume_type,attachments', 
+        weight: 15,
+        category: 'storage'
+      },
+      { 
+        name: 'cloud_volume_snapshots', 
+        url: '/api/cloud_volume_snapshots?expand=resources&attributes=id,name,size,status,cloud_volume_id', 
+        weight: 10,
+        category: 'storage'
+      },
+      { 
+        name: 'cloud_volume_types', 
+        url: '/api/cloud_volume_types?expand=resources&attributes=id,name,description,ems_id', 
+        weight: 10,
+        category: 'storage'
+      },
+      
+      // === SECURITY ENDPOINTS (25% delle chiamate) ===
+      { 
+        name: 'security_groups', 
+        url: '/api/security_groups?expand=resources&attributes=id,name,description,cloud_network_id,firewall_rules', 
+        weight: 15,
+        category: 'security'
+      },
+      { 
+        name: 'security_policies', 
+        url: '/api/security_policies?expand=resources&attributes=id,name,description,ems_id', 
+        weight: 5,
+        category: 'security'
+      },
+      { 
+        name: 'security_policy_rules', 
+        url: '/api/security_policy_rules?expand=resources&attributes=id,name,action,direction', 
+        weight: 5,
+        category: 'security'
+      },
+    ];
+
+    const totalWeight = endpoints.reduce((sum, ep) => sum + ep.weight, 0);
+
+    function selectEndpoint() {
+      const random = Math.random() * totalWeight;
+      let cumulative = 0;
+      for (const endpoint of endpoints) {
+        cumulative += endpoint.weight;
+        if (random <= cumulative) return endpoint;
+      }
+      return endpoints[0];
+    }
+
+    export function setup() {
+      console.log('=== NETWORKING & STORAGE TEST SETUP ===');
+      
+      if (!BASE_URL || !USER || !PASS) {
+        fail('ERRORE: Variabili d\'ambiente mancanti');
+      }
+      
+      console.log(`URL ManageIQ: ${BASE_URL}`);
+      console.log(`User: ${USER}`);
+      
+      const credentials = encoding.b64encode(`${USER}:${PASS}`);
+      const authHeaders = {
+        'Authorization': `Basic ${credentials}`,
+        'Accept': 'application/json',
+      };
+
+      console.log('Getting auth token...');
+      const res = http.get(`${BASE_URL}/api/auth`, { headers: authHeaders });
+
+      if (res.status !== 200) {
+        console.error(`Auth FAILED! Status: ${res.status}`);
+        fail(`Auth failed with status ${res.status}`);
+      }
+
+      const token = res.json('auth_token');
+      if (!token) fail('Token not received');
+
+      console.log(' Auth SUCCESS - Token obtained');
+      console.log(' Test endpoints:');
+      console.log('   - Network: 4 endpoints (40%)');
+      console.log('   - Storage: 3 endpoints (35%)');
+      console.log('   - Security: 3 endpoints (25%)');
+      console.log('=== SETUP COMPLETE ===\n');
+      
+      return { token: token, baseUrl: BASE_URL };
+    }
+
+    export default function (data) {
+      if (!data.token) {
+        console.error('Token not available');
+        return;
+      }
+
+      const endpoint = selectEndpoint();
+      const url = `${data.baseUrl}${endpoint.url}`;
+      
+      const params = {
+        headers: {
+          'X-Auth-Token': data.token,
+          'Accept': 'application/json',
+        },
+        tags: { 
+          name: endpoint.name,
+          category: endpoint.category,
+        },
+      };
+      
+      const startTime = Date.now();
+      const response = http.get(url, params);
+      const duration = Date.now() - startTime;
+
+      const success = check(response, {
+        [`${endpoint.name}: status 200`]: (r) => r.status === 200,
+        [`${endpoint.name}: has body`]: (r) => r.body && r.body.length > 0,
+      });
+
+      errorRate.add(!success);
+      
+      // Track by category
+      switch (endpoint.category) {
+        case 'network':
+          networkCheckDuration.add(duration);
+          break;
+        case 'storage':
+          storageCheckDuration.add(duration);
+          break;
+        case 'security':
+          securityCheckDuration.add(duration);
+          break;
+      }
+
+      if (response.status === 200) {
+        try {
+          const body = JSON.parse(response.body);
+          
+          // Specific checks per endpoint
+          switch (endpoint.name) {
+            case 'cloud_networks':
+              check(body, {
+                'has networks': (b) => b.count >= 0,
+                'networks have id': (b) => !b.resources || b.resources.length === 0 || b.resources[0].id !== undefined,
+              });
+              break;
+            case 'cloud_subnets':
+              check(body, {
+                'has subnets': (b) => b.count >= 0,
+                'subnets have CIDR': (b) => !b.resources || b.resources.length === 0 || b.resources[0].cidr !== undefined,
+              });
+              break;
+            case 'cloud_volumes':
+              check(body, {
+                'has volumes': (b) => b.count >= 0,
+                'volumes have size': (b) => !b.resources || b.resources.length === 0 || b.resources[0].size !== undefined,
+              });
+              break;
+            case 'security_groups':
+              check(body, {
+                'has security groups': (b) => b.count >= 0,
+                'has resources array': (b) => Array.isArray(b.resources),
+              });
+              break;
+          }
+        } catch (e) {
+          console.error(`Failed to parse JSON for ${endpoint.name}: ${e}`);
+          errorRate.add(1);
+        }
+      } else {
+        console.error(` ${endpoint.name} (${endpoint.category}) | Status: ${response.status}`);
+      }
+
+      sleep(Math.random() * 2 + 1);
+    }
+
+    export function teardown(data) {
+      console.log('\n=== NETWORKING & STORAGE TEST COMPLETED ===');
+    }
+
+---
+# 3. POD K6 NETWORKING & STORAGE
+apiVersion: v1
+kind: Pod
+metadata:
+  name: k6-network-storage-test
+  namespace: k6-tests
+  labels:
+    app: k6-network-storage
+spec:
+  containers:
+  - name: k6
+    image: grafana/k6:latest
+    command:
+      - k6
+      - run
+      - --out
+      - experimental-prometheus-rw
+      - /scripts/test.js
+    env:
+    # ========================================================
+    # CONFIGURAZIONE MANAGEIQ - MODIFICA SE NECESSARIO
+    # ========================================================
+    - name: MANAGEIQ_URL 
+      value: "https://10.1.98.72"  # CAMBIA QUI: Hostname o IP ManageIQ/LoadBalancer
+    - name: MIQ_USER
+      value: "admin"
+    - name: MIQ_PASS
+      value: "smartvm"  # Cambia se password diversa da "smartvm"
+#  IMPORTANTE: Verifica URL Prometheus corretto!
+    - name: K6_PROMETHEUS_RW_SERVER_URL
+      value: "http://8dcmp-mon-kube-prometheus-st-prometheus.monitoring.svc.cluster.local:9090/api/v1/write"  # CAMBIA: Service Prometheus (es: prometheus-operated, prometheus-server)
+    # Formato: http://SERVICE_NAME.NAMESPACE.svc.cluster.local:9090/api/v1/write
+    # Verifica con: kubectl get svc -n monitoring | grep prometheus
+    resources:
+      requests:
+        cpu: 200m
+        memory: 256Mi
+      limits:
+        cpu: 500m
+        memory: 512Mi
+    volumeMounts:
+    - name: k6-script
+      mountPath: /scripts
+  volumes:
+  - name: k6-script
+    configMap:
+      name: k6-network-storage-script
+  restartPolicy: Never

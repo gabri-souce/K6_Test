@@ -1,0 +1,241 @@
+# =====================================================================
+# K6 MANAGEIQ PROVISIONING WORKFLOW TEST - CONFIGURAZIONE COMPLETA
+# =====================================================================
+# 1. DEFINIZIONE DEL NAMESPACE
+apiVersion: v1
+kind: Namespace
+metadata:
+  name: k6-tests
+
+---
+# 2. CONFIGMAP SCRIPT K6 PROVISIONING
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: k6-provisioning-script
+  namespace: k6-tests
+data:
+  test.js: |
+    import http from 'k6/http';
+    import { check, sleep, fail } from 'k6';
+    import { Rate, Trend } from 'k6/metrics';
+    import encoding from 'k6/encoding';
+
+    // Custom metrics
+    const errorRate = new Rate('errors');
+    const provisioningCheckDuration = new Trend('provisioning_check_duration');
+
+    export const options = {
+      insecureSkipTLSVerify: true,
+      stages: [
+        { duration: '1m', target: 10 },
+        { duration: '3m', target: 10 },
+        { duration: '30s', target: 0 },
+      ],
+      thresholds: {
+        'http_req_duration{expected_response:true}': ['p(95)<3000'],
+        'http_req_failed': ['rate<0.10'],
+        'errors': ['rate<0.10'],
+        'provisioning_check_duration': ['p(95)<5000'],
+      },
+    };
+
+    const BASE_URL = __ENV.MANAGEIQ_URL;
+    const USER = __ENV.MIQ_USER;
+    const PASS = __ENV.MIQ_PASS;
+
+    // Provisioning-related endpoints
+    const endpoints = [
+      { name: 'list_provision_requests', url: '/api/provision_requests?expand=resources&attributes=id,description,status,created_on', weight: 20 },
+      { name: 'provision_request_ok', url: '/api/provision_requests/327?attributes=id,description,status,created_on,options', weight: 10 },
+      { name: 'provision_request_error', url: '/api/provision_requests/282?attributes=id,description,status,created_on,message', weight: 10 },
+      { name: 'availability_zones', url: '/api/availability_zones?filter[]=ems_id=42&expand=resources', weight: 15 },
+      { name: 'flavors', url: '/api/flavors?filter[]=ems_id=42&expand=resources&attributes=id,name,cpus,memory', weight: 15 },
+      { name: 'templates', url: '/api/templates?filter[]=ems_id=42&expand=resources&attributes=id,name,ems_id', weight: 15 },
+      { name: 'cloud_tenants', url: '/api/cloud_tenants?filter[]=ems_id=42&expand=resources&attributes=id,name', weight: 10 },
+      { name: 'provider_details', url: '/api/providers/42?attributes=id,name,type,zone,enabled', weight: 5 },
+    ];
+
+    const totalWeight = endpoints.reduce((sum, ep) => sum + ep.weight, 0);
+
+    function selectEndpoint() {
+      const random = Math.random() * totalWeight;
+      let cumulative = 0;
+      for (const endpoint of endpoints) {
+        cumulative += endpoint.weight;
+        if (random <= cumulative) return endpoint;
+      }
+      return endpoints[0];
+    }
+
+    export function setup() {
+      console.log('=== PROVISIONING WORKFLOW TEST SETUP ===');
+      
+      if (!BASE_URL || !USER || !PASS) {
+        fail('ERRORE: Variabili d\'ambiente mancanti (MANAGEIQ_URL, MIQ_USER, MIQ_PASS)');
+      }
+      
+      console.log(`URL ManageIQ: ${BASE_URL}`);
+      console.log(`User: ${USER}`);
+      
+      const credentials = encoding.b64encode(`${USER}:${PASS}`);
+      const authHeaders = {
+        'Authorization': `Basic ${credentials}`,
+        'Accept': 'application/json',
+      };
+
+      console.log('Getting auth token...');
+      const res = http.get(`${BASE_URL}/api/auth`, { headers: authHeaders });
+
+      if (res.status !== 200) {
+        console.error(`Auth FAILED! Status: ${res.status}`);
+        console.error(`Response: ${res.body}`);
+        fail(`Auth failed with status ${res.status}`);
+      }
+
+      const token = res.json('auth_token');
+      if (!token) {
+        fail('Token not received despite status 200');
+      }
+
+      console.log(' Auth SUCCESS - Token obtained');
+      console.log(`${endpoints.length} provisioning endpoints loaded`);
+      console.log('=== SETUP COMPLETE ===\n');
+      
+      return { token: token, baseUrl: BASE_URL };
+    }
+
+    export default function (data) {
+      if (!data.token) {
+        console.error('Token not available');
+        return;
+      }
+
+      const endpoint = selectEndpoint();
+      const url = `${data.baseUrl}${endpoint.url}`;
+      
+      const params = {
+        headers: {
+          'X-Auth-Token': data.token,
+          'Accept': 'application/json',
+        },
+        tags: { 
+          name: endpoint.name,
+        },
+      };
+      
+      const startTime = Date.now();
+      const response = http.get(url, params);
+      const duration = Date.now() - startTime;
+
+      const success = check(response, {
+        [`${endpoint.name}: status 200`]: (r) => r.status === 200,
+        [`${endpoint.name}: has body`]: (r) => r.body && r.body.length > 0,
+      });
+
+      errorRate.add(!success);
+      
+      if (endpoint.name.includes('provision_request')) {
+        provisioningCheckDuration.add(duration);
+      }
+
+      if (response.status === 200) {
+        try {
+          const body = JSON.parse(response.body);
+          
+          switch (endpoint.name) {
+            case 'list_provision_requests':
+              check(body, {
+                'has provision requests': (b) => b.count > 0,
+                'has resources array': (b) => Array.isArray(b.resources),
+              });
+              break;
+            case 'provision_request_ok':
+              check(body, {
+                'status is Ok': (b) => b.status === 'Ok',
+                'has options': (b) => b.options !== undefined,
+              });
+              break;
+            case 'provision_request_error':
+              check(body, {
+                'status is Error': (b) => b.status === 'Error',
+                'has error message': (b) => b.message !== undefined,
+              });
+              break;
+            case 'flavors':
+              check(body, { 'has flavors': (b) => b.count >= 3 });
+              break;
+            case 'templates':
+              check(body, { 'has templates': (b) => b.count >= 5 });
+              break;
+            case 'availability_zones':
+              check(body, { 'has zones': (b) => b.count >= 2 });
+              break;
+            case 'provider_details':
+              check(body, { 'provider enabled': (b) => b.enabled === true });
+              break;
+          }
+        } catch (e) {
+          console.error(`Failed to parse JSON for ${endpoint.name}: ${e}`);
+          errorRate.add(1);
+        }
+      } else {
+        console.error(` ${endpoint.name} | Status: ${response.status}`);
+      }
+
+      sleep(Math.random() * 2 + 1);
+    }
+
+    export function teardown(data) {
+      console.log('\n=== PROVISIONING TEST COMPLETED ===');
+    }
+
+---
+# 3. DEFINIZIONE DEL POD K6 PROVISIONING
+apiVersion: v1
+kind: Pod
+metadata:
+  name: k6-provisioning-test
+  namespace: k6-tests
+  labels:
+    app: k6-provisioning-test
+spec:
+  containers:
+  - name: k6
+    image: grafana/k6:latest
+    command:
+      - k6
+      - run
+      - --out
+      - experimental-prometheus-rw
+      - /scripts/test.js
+    env:
+    # ========================================================
+    # CONFIGURAZIONE MANAGEIQ - MODIFICA SE NECESSARIO
+    # ========================================================
+    - name: MANAGEIQ_URL 
+      value: "https://10.1.98.72"  # CAMBIA QUI: Hostname o IP ManageIQ/LoadBalancer
+    - name: MIQ_USER
+      value: "admin"
+    - name: MIQ_PASS
+      value: "smartvm"  # Cambia se password diversa da "smartvm"
+#  IMPORTANTE: Verifica URL Prometheus corretto!
+    - name: K6_PROMETHEUS_RW_SERVER_URL
+      value: "http://8dcmp-mon-kube-prometheus-st-prometheus.monitoring.svc.cluster.local:9090/api/v1/write"  # CAMBIA: Service Prometheus (es: prometheus-operated, prometheus-server)
+    # Formato: http://SERVICE_NAME.NAMESPACE.svc.cluster.local:9090/api/v1/write
+    # Verifica con: kubectl get svc -n monitoring | grep prometheus
+    resources:
+      requests:
+        cpu: 200m
+        memory: 256Mi
+      limits:
+        cpu: 500m
+        memory: 512Mi
+    volumeMounts:
+    - name: k6-script
+      mountPath: /scripts
+  volumes:
+  - name: k6-script
+    configMap:
+      name: k6-provisioning-script
+  restartPolicy: Never

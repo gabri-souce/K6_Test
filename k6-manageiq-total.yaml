@@ -1,0 +1,357 @@
+# =====================================================================
+# K6 MANAGEIQ API STRESS TEST - CONFIGURAZIONE COMPLETA
+# =====================================================================
+
+# 1. DEFINIZIONE DEL NAMESPACE
+apiVersion: v1
+kind: Namespace
+metadata:
+  name: k6-tests
+
+---
+# 3. CONFIGMAP SCRIPT K6 (Script di test con autenticazione)
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: k6-script
+  namespace: k6-tests
+data:
+  test.js: |
+    import http from 'k6/http';
+    import { check, sleep, fail } from 'k6';
+    import { SharedArray } from 'k6/data';
+    import papaparse from 'https://jslib.k6.io/papaparse/5.1.1/index.js';
+    import encoding from 'k6/encoding';
+
+    // Caricamento CSV con gli endpoint API
+    const apiCalls = new SharedArray('api calls', function () {
+      try {
+        const csvData = open('/data/api_calls_complete.csv');
+        const parsed = papaparse.parse(csvData, { header: true });
+        return parsed.data.filter(row => row.path && row.path.length > 0);
+      } catch (e) {
+        console.error(`Errore nel caricamento del CSV: ${e.message}`);
+        throw new Error('CSV data file not found or corrupted.');
+      }
+    });
+
+    // PROFILO DI CARICO DEL TEST
+    export const options = {
+      stages: [
+        
+        { duration: '30s', target: 5 },   // Ramp-up: aumenta a 5 utenti virtuali
+        { duration: '2m', target: 5 },    // Steady state: mantieni 5 VUs per 2 minuti
+        { duration: '30s', target: 0 },   // Ramp-down: scendi a 0
+      ],
+      
+      thresholds: {
+        'http_req_duration{expected_response:true}': ['p(95)<2000'], // 95% delle richieste sotto 2s
+        'http_req_failed': ['rate<0.10'],  // Meno del 10% di errori
+      },
+      insecureSkipTLSVerify: true,  // Ignora certificati SSL self-signed
+    };
+
+    // VARIABILI D'AMBIENTE
+    const BASE_URL = __ENV.MANAGEIQ_URL; 
+    const USER = __ENV.MIQ_USER;
+    const PASS = __ENV.MIQ_PASS;
+
+    // SETUP: Eseguito una sola volta all'inizio del test
+    export function setup() {
+      console.log('=== INIZIO SETUP ===');
+      
+      // Verifica variabili d'ambiente
+      if (!BASE_URL || !USER || !PASS) {
+        fail('ERRORE: Variabili d\'ambiente mancanti (MANAGEIQ_URL, MIQ_USER, MIQ_PASS)');
+      }
+      
+      console.log(`URL ManageIQ: ${BASE_URL}`);
+      console.log(`User: ${USER}`);
+      
+      // Costruzione header Basic Auth
+      const credentials = encoding.b64encode(`${USER}:${PASS}`);
+      const authHeaders = {
+        'Authorization': `Basic ${credentials}`,
+        'Accept': 'application/json',
+      };
+
+      // Autenticazione e recupero token
+      console.log('Tentativo di autenticazione...');
+      const res = http.get(`${BASE_URL}/api/auth`, { headers: authHeaders });
+
+      if (res.status !== 200) {
+        console.error(`Autenticazione FALLITA! Status: ${res.status}`);
+        console.error(`Response: ${res.body}`);
+        fail(`Autenticazione fallita con status ${res.status}`); 
+      }
+
+      const token = res.json('auth_token');
+      if (!token) {
+        fail('Token non ricevuto nonostante status 200');
+      }
+
+      console.log(' Autenticazione RIUSCITA - Token ottenuto');
+      console.log(`CSV caricato: ${apiCalls.length} endpoint disponibili`);
+      console.log('=== FINE SETUP ===\n');
+      
+      return { token: token, baseUrl: BASE_URL };
+    }
+
+    // FUNZIONE PRINCIPALE: Esegue le chiamate API
+    export default function (data) {
+      if (!data.token) {
+        console.error('Token non disponibile, impossibile procedere');
+        return;
+      }
+
+      const token = data.token;
+      const baseUrl = data.baseUrl;
+
+      // Selezione casuale di un endpoint dal CSV
+      const apiCall = apiCalls[Math.floor(Math.random() * apiCalls.length)];
+      const url = baseUrl + apiCall.path + '?' + (apiCall.params || 'expand=resources&limit=100');
+      
+      const params = {
+        headers: {
+          'X-Auth-Token': token, 
+          'Accept': 'application/json',
+        },
+        tags: { 
+          name: apiCall.name,
+          path: apiCall.path
+        },
+      };
+
+      // Esecuzione chiamata API
+      const res = http.get(url, params);
+      
+      // Log dettagliato in caso di errore
+      if (res.status < 200 || res.status >= 300) {
+        console.error(` FAILED: ${apiCall.name} | ${apiCall.path} | Status: ${res.status} | Body: ${res.body.substring(0, 200)}`);
+      }
+      
+      // Verifica dello stato della risposta
+      check(res, {
+        [`${apiCall.name} Status 2xx`]: (r) => r.status >= 200 && r.status < 300,
+      });
+      
+      sleep(1);  // Pausa di 1 secondo tra le richieste
+    }
+
+    // TEARDOWN: Eseguito alla fine del test
+    export function teardown(data) {
+      console.log('\n=== TEST COMPLETATO ===');
+    }
+
+---
+# 4. CONFIGMAP DATI CSV (Lista completa degli endpoint ManageIQ)
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: k6-csv-data
+  namespace: k6-tests
+data:
+  api_calls_complete.csv: |
+    name,path,method,params,full_url
+    "accounts","/api/accounts","GET","expand=resources&limit=100","https://10.1.98.72/api/accounts"
+    "actions","/api/actions","GET","expand=resources&limit=100","https://10.1.98.72/api/actions"
+    "alert_actions","/api/alert_actions","GET","expand=resources&limit=100","https://10.1.98.72/api/alert_actions"
+    "alert_definition_profiles","/api/alert_definition_profiles","GET","expand=resources&limit=100","https://10.1.98.72/api/alert_definition_profiles"
+    "alert_definitions","/api/alert_definitions","GET","expand=resources&limit=100","https://10.1.98.72/api/alert_definitions"
+    "alerts","/api/alerts","GET","expand=resources&limit=100","https://10.1.98.72/api/alerts"
+    "auth","/api/auth","GET","","https://10.1.98.72/api/auth"
+    "auth_key_pairs","/api/auth_key_pairs","GET","expand=resources&limit=100","https://10.1.98.72/api/auth_key_pairs"
+    "authentications","/api/authentications","GET","expand=resources&limit=100","https://10.1.98.72/api/authentications"
+    "automate","/api/automate","GET","expand=resources&limit=100","https://10.1.98.72/api/automate"
+    "automate_classes","/api/automate_classes","GET","expand=resources&limit=100","https://10.1.98.72/api/automate_classes"
+    "automate_domains","/api/automate_domains","GET","expand=resources&limit=100","https://10.1.98.72/api/automate_domains"
+    "automate_workspaces","/api/automate_workspaces","GET","expand=resources&limit=100","https://10.1.98.72/api/automate_workspaces"
+    "automation_requests","/api/automation_requests","GET","expand=resources&limit=100","https://10.1.98.72/api/automation_requests"
+    "availability_zones","/api/availability_zones","GET","expand=resources&limit=100","https://10.1.98.72/api/availability_zones"
+    "categories","/api/categories","GET","expand=resources&limit=100","https://10.1.98.72/api/categories"
+    "cdroms","/api/cdroms","GET","expand=resources&limit=100","https://10.1.98.72/api/cdroms"
+    "chargeable_fields","/api/chargeable_fields","GET","expand=resources&limit=100","https://10.1.98.72/api/chargeable_fields"
+    "chargebacks","/api/chargebacks","GET","expand=resources&limit=100","https://10.1.98.72/api/chargebacks"
+    "cloud_database_flavors","/api/cloud_database_flavors","GET","expand=resources&limit=100","https://10.1.98.72/api/cloud_database_flavors"
+    "cloud_databases","/api/cloud_databases","GET","expand=resources&limit=100","https://10.1.98.72/api/cloud_databases"
+    "cloud_networks","/api/cloud_networks","GET","expand=resources&limit=100","https://10.1.98.72/api/cloud_networks"
+    "cloud_object_store_containers","/api/cloud_object_store_containers","GET","expand=resources&limit=100","https://10.1.98.72/api/cloud_object_store_containers"
+    "cloud_object_store_objects","/api/cloud_object_store_objects","GET","expand=resources&limit=100","https://10.1.98.72/api/cloud_object_store_objects"
+    "cloud_subnets","/api/cloud_subnets","GET","expand=resources&limit=100","https://10.1.98.72/api/cloud_subnets"
+    "cloud_templates","/api/cloud_templates","GET","expand=resources&limit=100","https://10.1.98.72/api/cloud_templates"
+    "cloud_tenants","/api/cloud_tenants","GET","expand=resources&limit=100","https://10.1.98.72/api/cloud_tenants"
+    "cloud_volume_snapshots","/api/cloud_volume_snapshots","GET","expand=resources&limit=100","https://10.1.98.72/api/cloud_volume_snapshots"
+    "cloud_volume_types","/api/cloud_volume_types","GET","expand=resources&limit=100","https://10.1.98.72/api/cloud_volume_types"
+    "cloud_volumes","/api/cloud_volumes","GET","expand=resources&limit=100","https://10.1.98.72/api/cloud_volumes"
+    "clusters","/api/clusters","GET","expand=resources&limit=100","https://10.1.98.72/api/clusters"
+    "compliances","/api/compliances","GET","expand=resources&limit=100","https://10.1.98.72/api/compliances"
+    "conditions","/api/conditions","GET","expand=resources&limit=100","https://10.1.98.72/api/conditions"
+    "configuration_profiles","/api/configuration_profiles","GET","expand=resources&limit=100","https://10.1.98.72/api/configuration_profiles"
+    "configuration_script_payloads","/api/configuration_script_payloads","GET","expand=resources&limit=100","https://10.1.98.72/api/configuration_script_payloads"
+    "configuration_script_sources","/api/configuration_script_sources","GET","expand=resources&limit=100","https://10.1.98.72/api/configuration_script_sources"
+    "configuration_scripts","/api/configuration_scripts","GET","expand=resources&limit=100","https://10.1.98.72/api/configuration_scripts"
+    "configured_systems","/api/configured_systems","GET","expand=resources&limit=100","https://10.1.98.72/api/configured_systems"
+    "container_groups","/api/container_groups","GET","expand=resources&limit=100","https://10.1.98.72/api/container_groups"
+    "container_images","/api/container_images","GET","expand=resources&limit=100","https://10.1.98.72/api/container_images"
+    "container_nodes","/api/container_nodes","GET","expand=resources&limit=100","https://10.1.98.72/api/container_nodes"
+    "container_projects","/api/container_projects","GET","expand=resources&limit=100","https://10.1.98.72/api/container_projects"
+    "container_templates","/api/container_templates","GET","expand=resources&limit=100","https://10.1.98.72/api/container_templates"
+    "container_volumes","/api/container_volumes","GET","expand=resources&limit=100","https://10.1.98.72/api/container_volumes"
+    "containers","/api/containers","GET","expand=resources&limit=100","https://10.1.98.72/api/containers"
+    "currencies","/api/currencies","GET","expand=resources&limit=100","https://10.1.98.72/api/currencies"
+    "custom_attributes","/api/custom_attributes","GET","expand=resources&limit=100","https://10.1.98.72/api/custom_attributes"
+    "custom_button_events","/api/custom_button_events","GET","expand=resources&limit=100","https://10.1.98.72/api/custom_button_events"
+    "custom_button_sets","/api/custom_button_sets","GET","expand=resources&limit=100","https://10.1.98.72/api/custom_button_sets"
+    "custom_buttons","/api/custom_buttons","GET","expand=resources&limit=100","https://10.1.98.72/api/custom_buttons"
+    "customization_scripts","/api/customization_scripts","GET","expand=resources&limit=100","https://10.1.98.72/api/customization_scripts"
+    "customization_templates","/api/customization_templates","GET","expand=resources&limit=100","https://10.1.98.72/api/customization_templates"
+    "data_stores","/api/data_stores","GET","expand=resources&limit=100","https://10.1.98.72/api/data_stores"
+    "disks","/api/disks","GET","expand=resources&limit=100","https://10.1.98.72/api/disks"
+    "enterprises","/api/enterprises","GET","expand=resources&limit=100","https://10.1.98.72/api/enterprises"
+    "event_streams","/api/event_streams","GET","expand=resources&limit=100","https://10.1.98.72/api/event_streams"
+    "events","/api/events","GET","expand=resources&limit=100","https://10.1.98.72/api/events"
+    "features","/api/features","GET","expand=resources&limit=100","https://10.1.98.72/api/features"
+    "firmware_binaries","/api/firmware_binaries","GET","expand=resources&limit=100","https://10.1.98.72/api/firmware_binaries"
+    "firmware_registries","/api/firmware_registries","GET","expand=resources&limit=100","https://10.1.98.72/api/firmware_registries"
+    "firmwares","/api/firmwares","GET","expand=resources&limit=100","https://10.1.98.72/api/firmwares"
+    "flavors","/api/flavors","GET","expand=resources&limit=100","https://10.1.98.72/api/flavors"
+    "floating_ips","/api/floating_ips","GET","expand=resources&limit=100","https://10.1.98.72/api/floating_ips"
+    "folders","/api/folders","GET","expand=resources&limit=100","https://10.1.98.72/api/folders"
+    "generic_object_definitions","/api/generic_object_definitions","GET","expand=resources&limit=100","https://10.1.98.72/api/generic_object_definitions"
+    "generic_objects","/api/generic_objects","GET","expand=resources&limit=100","https://10.1.98.72/api/generic_objects"
+    "groups","/api/groups","GET","expand=resources&limit=100","https://10.1.98.72/api/groups"
+    "guest_devices","/api/guest_devices","GET","expand=resources&limit=100","https://10.1.98.72/api/guest_devices"
+    "host_aggregates","/api/host_aggregates","GET","expand=resources&limit=100","https://10.1.98.72/api/host_aggregates"
+    "host_initiator_groups","/api/host_initiator_groups","GET","expand=resources&limit=100","https://10.1.98.72/api/host_initiator_groups"
+    "host_initiators","/api/host_initiators","GET","expand=resources&limit=100","https://10.1.98.72/api/host_initiators"
+    "hosts","/api/hosts","GET","expand=resources&limit=100","https://10.1.98.72/api/hosts"
+    "instances","/api/instances","GET","expand=resources&limit=100","https://10.1.98.72/api/instances"
+    "iso_images","/api/iso_images","GET","expand=resources&limit=100","https://10.1.98.72/api/iso_images"
+    "lans","/api/lans","GET","expand=resources&limit=100","https://10.1.98.72/api/lans"
+    "load_balancers","/api/load_balancers","GET","expand=resources&limit=100","https://10.1.98.72/api/load_balancers"
+    "measures","/api/measures","GET","expand=resources&limit=100","https://10.1.98.72/api/measures"
+    "metric_rollups","/api/metric_rollups","GET","expand=resources&limit=100","https://10.1.98.72/api/metric_rollups"
+    "metrics","/api/metrics","GET","expand=resources&limit=100","https://10.1.98.72/api/metrics"
+    "network_routers","/api/network_routers","GET","expand=resources&limit=100","https://10.1.98.72/api/network_routers"
+    "network_services","/api/network_services","GET","expand=resources&limit=100","https://10.1.98.72/api/network_services"
+    "networks","/api/networks","GET","expand=resources&limit=100","https://10.1.98.72/api/networks"
+    "notifications","/api/notifications","GET","expand=resources&limit=100","https://10.1.98.72/api/notifications"
+    "orchestration_stacks","/api/orchestration_stacks","GET","expand=resources&limit=100","https://10.1.98.72/api/orchestration_stacks"
+    "orchestration_templates","/api/orchestration_templates","GET","expand=resources&limit=100","https://10.1.98.72/api/orchestration_templates"
+    "physical_chassis","/api/physical_chassis","GET","expand=resources&limit=100","https://10.1.98.72/api/physical_chassis"
+    "physical_racks","/api/physical_racks","GET","expand=resources&limit=100","https://10.1.98.72/api/physical_racks"
+    "physical_server_profiles","/api/physical_server_profiles","GET","expand=resources&limit=100","https://10.1.98.72/api/physical_server_profiles"
+    "physical_servers","/api/physical_servers","GET","expand=resources&limit=100","https://10.1.98.72/api/physical_servers"
+    "physical_storage_families","/api/physical_storage_families","GET","expand=resources&limit=100","https://10.1.98.72/api/physical_storage_families"
+    "physical_storages","/api/physical_storages","GET","expand=resources&limit=100","https://10.1.98.72/api/physical_storages"
+    "physical_switches","/api/physical_switches","GET","expand=resources&limit=100","https://10.1.98.72/api/physical_switches"
+    "pictures","/api/pictures","GET","expand=resources&limit=100","https://10.1.98.72/api/pictures"
+    "policies","/api/policies","GET","expand=resources&limit=100","https://10.1.98.72/api/policies"
+    "policy_actions","/api/policy_actions","GET","expand=resources&limit=100","https://10.1.98.72/api/policy_actions"
+    "policy_profiles","/api/policy_profiles","GET","expand=resources&limit=100","https://10.1.98.72/api/policy_profiles"
+    "providers","/api/providers","GET","expand=resources&limit=100","https://10.1.98.72/api/providers"
+    "provision_dialogs","/api/provision_dialogs","GET","expand=resources&limit=100","https://10.1.98.72/api/provision_dialogs"
+    "provision_requests","/api/provision_requests","GET","expand=resources&limit=100","https://10.1.98.72/api/provision_requests"
+    "pxe_image_types","/api/pxe_image_types","GET","expand=resources&limit=100","https://10.1.98.72/api/pxe_image_types"
+    "pxe_images","/api/pxe_images","GET","expand=resources&limit=100","https://10.1.98.72/api/pxe_images"
+    "pxe_menus","/api/pxe_menus","GET","expand=resources&limit=100","https://10.1.98.72/api/pxe_menus"
+    "pxe_servers","/api/pxe_servers","GET","expand=resources&limit=100","https://10.1.98.72/api/pxe_servers"
+    "quotas","/api/quotas","GET","expand=resources&limit=100","https://10.1.98.72/api/quotas"
+    "rates","/api/rates","GET","expand=resources&limit=100","https://10.1.98.72/api/rates"
+    "regions","/api/regions","GET","expand=resources&limit=100","https://10.1.98.72/api/regions"
+    "reports","/api/reports","GET","expand=resources&limit=100","https://10.1.98.72/api/reports"
+    "request_tasks","/api/request_tasks","GET","expand=resources&limit=100","https://10.1.98.72/api/request_tasks"
+    "requests","/api/requests","GET","expand=resources&limit=100","https://10.1.98.72/api/requests"
+    "resource_actions","/api/resource_actions","GET","expand=resources&limit=100","https://10.1.98.72/api/resource_actions"
+    "resource_pools","/api/resource_pools","GET","expand=resources&limit=100","https://10.1.98.72/api/resource_pools"
+    "results","/api/results","GET","expand=resources&limit=100","https://10.1.98.72/api/results"
+    "roles","/api/roles","GET","expand=resources&limit=100","https://10.1.98.72/api/roles"
+    "schedules","/api/schedules","GET","expand=resources&limit=100","https://10.1.98.72/api/schedules"
+    "search_filters","/api/search_filters","GET","expand=resources&limit=100","https://10.1.98.72/api/search_filters"
+    "security_groups","/api/security_groups","GET","expand=resources&limit=100","https://10.1.98.72/api/security_groups"
+    "security_policies","/api/security_policies","GET","expand=resources&limit=100","https://10.1.98.72/api/security_policies"
+    "security_policy_rules","/api/security_policy_rules","GET","expand=resources&limit=100","https://10.1.98.72/api/security_policy_rules"
+    "servers","/api/servers","GET","expand=resources&limit=100","https://10.1.98.72/api/servers"
+    "service_catalogs","/api/service_catalogs","GET","expand=resources&limit=100","https://10.1.98.72/api/service_catalogs"
+    "service_dialogs","/api/service_dialogs","GET","expand=resources&limit=100","https://10.1.98.72/api/service_dialogs"
+    "service_offerings","/api/service_offerings","GET","expand=resources&limit=100","https://10.1.98.72/api/service_offerings"
+    "service_orders","/api/service_orders","GET","expand=resources&limit=100","https://10.1.98.72/api/service_orders"
+    "service_parameters_sets","/api/service_parameters_sets","GET","expand=resources&limit=100","https://10.1.98.72/api/service_parameters_sets"
+    "service_requests","/api/service_requests","GET","expand=resources&limit=100","https://10.1.98.72/api/service_requests"
+    "service_templates","/api/service_templates","GET","expand=resources&limit=100","https://10.1.98.72/api/service_templates"
+    "services","/api/services","GET","expand=resources&limit=100","https://10.1.98.72/api/services"
+    "settings","/api/settings","GET","expand=resources&limit=100","https://10.1.98.72/api/settings"
+    "shortcuts","/api/shortcuts","GET","expand=resources&limit=100","https://10.1.98.72/api/shortcuts"
+    "snapshots","/api/snapshots","GET","expand=resources&limit=100","https://10.1.98.72/api/snapshots"
+    "software","/api/software","GET","expand=resources&limit=100","https://10.1.98.72/api/software"
+    "storage_resources","/api/storage_resources","GET","expand=resources&limit=100","https://10.1.98.72/api/storage_resources"
+    "storage_services","/api/storage_services","GET","expand=resources&limit=100","https://10.1.98.72/api/storage_services"
+    "switches","/api/switches","GET","expand=resources&limit=100","https://10.1.98.72/api/switches"
+    "tags","/api/tags","GET","expand=resources&limit=100","https://10.1.98.72/api/tags"
+    "tasks","/api/tasks","GET","expand=resources&limit=100","https://10.1.98.72/api/tasks"
+    "templates","/api/templates","GET","expand=resources&limit=100","https://10.1.98.72/api/templates"
+    "tenants","/api/tenants","GET","expand=resources&limit=100","https://10.1.98.72/api/tenants"
+    "time_profiles","/api/time_profiles","GET","expand=resources&limit=100","https://10.1.98.72/api/time_profiles"
+    "users","/api/users","GET","expand=resources&limit=100","https://10.1.98.72/api/users"
+    "vms","/api/vms","GET","expand=resources&limit=100","https://10.1.98.72/api/vms"
+    "volume_mappings","/api/volume_mappings","GET","expand=resources&limit=100","https://10.1.98.72/api/volume_mappings"
+    "widgets","/api/widgets","GET","expand=resources&limit=100","https://10.1.98.72/api/widgets"
+    "zones","/api/zones","GET","expand=resources&limit=100","https://10.1.98.72/api/zones"
+    
+---
+# 5. DEFINIZIONE DEL POD K6 (con variabili d'ambiente)
+apiVersion: v1
+kind: Pod
+metadata:
+  name: k6-manageiq-cloud
+  namespace: k6-tests
+  labels:
+    app: k6-test
+spec:
+  containers:
+  - name: k6
+    image: grafana/k6:latest
+    command:
+      - k6
+      - run
+      - --out
+      - experimental-prometheus-rw
+      - /scripts/test.js
+
+    env:
+    # ========================================================
+    # CONFIGURAZIONE MANAGEIQ - MODIFICA SE NECESSARIO
+    # ========================================================
+    #  MODIFICA QUESTI VALORI SE NECESSARIO 
+    - name: MANAGEIQ_URL 
+      value: "https://10.1.98.72"  # CAMBIA QUI: Hostname o IP ManageIQ/LoadBalancer
+    - name: MIQ_USER
+      value: "admin"
+    - name: MIQ_PASS
+      value: "smartvm"  # Cambia se password diversa da "smartvm"
+#  IMPORTANTE: Verifica URL Prometheus corretto!
+    - name: K6_PROMETHEUS_RW_SERVER_URL
+      value: "http://8dcmp-mon-kube-prometheus-st-prometheus.monitoring.svc.cluster.local:9090/api/v1/write"  # CAMBIA: Service Prometheus (es: prometheus-operated, prometheus-server)
+    # Formato: http://SERVICE_NAME.NAMESPACE.svc.cluster.local:9090/api/v1/write
+    # Verifica con: kubectl get svc -n monitoring | grep prometheus
+    # ------------------------------------------
+    resources:
+      requests:
+        cpu: 200m
+        memory: 256Mi
+      limits:
+        cpu: 500m
+        memory: 512Mi
+    volumeMounts:
+    - name: k6-script
+      mountPath: /scripts
+    - name: csv-data
+      mountPath: /data 
+  volumes:
+  - name: k6-script
+    configMap:
+      name: k6-script
+  - name: csv-data
+    configMap:
+      name: k6-csv-data
+  restartPolicy: Never

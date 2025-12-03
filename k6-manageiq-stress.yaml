@@ -1,0 +1,258 @@
+# =====================================================================
+# K6 MANAGEIQ API STRESS TEST AVANZATO - CARICO ELEVATO
+# =====================================================================
+# QUESTA VERSIONE UTILIZZA:
+# - 100 utenti virtuali (invece di 5)
+# - Test di durata 5 minuti (invece di 2)
+# - Risorse aumentate per il Pod (2 CPU, 2GB RAM)
+# - Richieste più aggressive (sleep ridotto a 0.1s)
+# =====================================================================
+
+# 1. DEFINIZIONE DEL NAMESPACE
+apiVersion: v1
+kind: Namespace
+metadata:
+  name: k6-tests
+
+---
+# 3. CONFIGMAP SCRIPT K6 - VERSIONE STRESS TEST
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: k6-script-stress
+  namespace: k6-tests
+data:
+  test.js: |
+    import http from 'k6/http';
+    import { check, sleep, fail } from 'k6';
+    import { SharedArray } from 'k6/data';
+    import papaparse from 'https://jslib.k6.io/papaparse/5.1.1/index.js';
+    import encoding from 'k6/encoding';
+
+    const apiCalls = new SharedArray('api calls', function () {
+      try {
+        const csvData = open('/data/api_calls_complete.csv');
+        const parsed = papaparse.parse(csvData, { header: true });
+        return parsed.data.filter(row => row.path && row.path.length > 0);
+      } catch (e) {
+        console.error(`Errore CSV: ${e.message}`);
+        throw new Error('CSV not found');
+      }
+    });
+
+    //  PROFILO STRESS TEST - 100 VUs PER 5 MINUTI 
+    export const options = {
+      stages: [
+        
+        { duration: '1m', target: 100 },   // Ramp-up veloce a 100 VUs
+        { duration: '5m', target: 100 },   // Mantieni 100 VUs per 5 minuti
+        { duration: '30s', target: 0 },    // Ramp-down
+      ],
+      
+      thresholds: {
+        'http_req_duration{expected_response:true}': ['p(95)<3000'],
+        'http_req_failed': ['rate<0.15'],
+      },
+      insecureSkipTLSVerify: true,
+    };
+
+    const BASE_URL = __ENV.MANAGEIQ_URL; 
+    const USER = __ENV.MIQ_USER;
+    const PASS = __ENV.MIQ_PASS;
+
+    export function setup() {
+      console.log('=== STRESS TEST MODE: 100 VUs ===');
+      
+      if (!BASE_URL || !USER || !PASS) {
+        fail('Variabili ambiente mancanti');
+      }
+      
+      const credentials = encoding.b64encode(`${USER}:${PASS}`);
+      const res = http.get(`${BASE_URL}/api/auth`, {
+        headers: {
+          'Authorization': `Basic ${credentials}`,
+          'Accept': 'application/json',
+        }
+      });
+
+      if (res.status !== 200) {
+        fail(`Auth failed: ${res.status}`); 
+      }
+
+      const token = res.json('auth_token');
+      if (!token) fail('No token received');
+
+      console.log(` Auth OK - ${apiCalls.length} endpoints loaded`);
+      return { token: token, baseUrl: BASE_URL };
+    }
+
+    export default function (data) {
+      if (!data.token) return;
+
+      const apiCall = apiCalls[Math.floor(Math.random() * apiCalls.length)];
+      const url = data.baseUrl + apiCall.path + '?' + (apiCall.params || 'expand=resources&limit=100');
+      
+      const res = http.get(url, {
+        headers: {
+          'X-Auth-Token': data.token, 
+          'Accept': 'application/json',
+        },
+        tags: { 
+          name: apiCall.name,
+          path: apiCall.path
+        },
+      });
+      
+      if (res.status < 200 || res.status >= 300) {
+        console.error(` ${apiCall.name} - Status: ${res.status}`);
+      }
+      
+      check(res, {
+        [`${apiCall.name} OK`]: (r) => r.status >= 200 && r.status < 300,
+      });
+      
+      sleep(0.1);  //  Sleep ridotto: 10x più aggressivo
+    }
+
+---
+# 4. CONFIGMAP CSV (identico, ma nome diverso per coesistenza)
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: k6-csv-data-stress
+  namespace: k6-tests
+data:
+  api_calls_complete.csv: |
+    name,path,method,params,full_url
+    "actions","/api/actions","GET","expand=resources&limit=100","https://10.1.98.72/api/actions"
+    "alert_definition_profiles","/api/alert_definition_profiles","GET","expand=resources&limit=100","https://10.1.98.72/api/alert_definition_profiles"
+    "alert_definitions","/api/alert_definitions","GET","expand=resources&limit=100","https://10.1.98.72/api/alert_definitions"
+    "alerts","/api/alerts","GET","expand=resources&limit=100","https://10.1.98.72/api/alerts"
+    "auth","/api/auth","GET","","https://10.1.98.72/api/auth"
+    "auth_key_pairs","/api/auth_key_pairs","GET","expand=resources&limit=100","https://10.1.98.72/api/auth_key_pairs"
+    "authentications","/api/authentications","GET","expand=resources&limit=100","https://10.1.98.72/api/authentications"
+    "automate","/api/automate","GET","expand=resources&limit=100","https://10.1.98.72/api/automate"
+    "automate_classes","/api/automate_classes","GET","expand=resources&limit=100","https://10.1.98.72/api/automate_classes"
+    "automate_domains","/api/automate_domains","GET","expand=resources&limit=100","https://10.1.98.72/api/automate_domains"
+    "automation_requests","/api/automation_requests","GET","expand=resources&limit=100","https://10.1.98.72/api/automation_requests"
+    "availability_zones","/api/availability_zones","GET","expand=resources&limit=100","https://10.1.98.72/api/availability_zones"
+    "categories","/api/categories","GET","expand=resources&limit=100","https://10.1.98.72/api/categories"
+    "chargeable_fields","/api/chargeable_fields","GET","expand=resources&limit=100","https://10.1.98.72/api/chargeable_fields"
+    "cloud_networks","/api/cloud_networks","GET","expand=resources&limit=100","https://10.1.98.72/api/cloud_networks"
+    "cloud_subnets","/api/cloud_subnets","GET","expand=resources&limit=100","https://10.1.98.72/api/cloud_subnets"
+    "cloud_templates","/api/cloud_templates","GET","expand=resources&limit=100","https://10.1.98.72/api/cloud_templates"
+    "cloud_tenants","/api/cloud_tenants","GET","expand=resources&limit=100","https://10.1.98.72/api/cloud_tenants"
+    "cloud_volume_snapshots","/api/cloud_volume_snapshots","GET","expand=resources&limit=100","https://10.1.98.72/api/cloud_volume_snapshots"
+    "cloud_volume_types","/api/cloud_volume_types","GET","expand=resources&limit=100","https://10.1.98.72/api/cloud_volume_types"
+    "cloud_volumes","/api/cloud_volumes","GET","expand=resources&limit=100","https://10.1.98.72/api/cloud_volumes"
+    "conditions","/api/conditions","GET","expand=resources&limit=100","https://10.1.98.72/api/conditions"
+    "configuration_script_payloads","/api/configuration_script_payloads","GET","expand=resources&limit=100","https://10.1.98.72/api/configuration_script_payloads"
+    "configuration_script_sources","/api/configuration_script_sources","GET","expand=resources&limit=100","https://10.1.98.72/api/configuration_script_sources"
+    "configuration_scripts","/api/configuration_scripts","GET","expand=resources&limit=100","https://10.1.98.72/api/configuration_scripts"
+    "configured_systems","/api/configured_systems","GET","expand=resources&limit=100","https://10.1.98.72/api/configured_systems"
+    "currencies","/api/currencies","GET","expand=resources&limit=100","https://10.1.98.72/api/currencies"
+    "custom_button_sets","/api/custom_button_sets","GET","expand=resources&limit=100","https://10.1.98.72/api/custom_button_sets"
+    "custom_buttons","/api/custom_buttons","GET","expand=resources&limit=100","https://10.1.98.72/api/custom_buttons"
+    "customization_templates","/api/customization_templates","GET","expand=resources&limit=100","https://10.1.98.72/api/customization_templates"
+    "enterprises","/api/enterprises","GET","expand=resources&limit=100","https://10.1.98.72/api/enterprises"
+    "event_streams","/api/event_streams","GET","expand=resources&limit=100","https://10.1.98.72/api/event_streams"
+    "events","/api/events","GET","expand=resources&limit=100","https://10.1.98.72/api/events"
+    "features","/api/features","GET","expand=resources&limit=100","https://10.1.98.72/api/features"
+    "flavors","/api/flavors","GET","expand=resources&limit=100","https://10.1.98.72/api/flavors"
+    "floating_ips","/api/floating_ips","GET","expand=resources&limit=100","https://10.1.98.72/api/floating_ips"
+    "generic_object_definitions","/api/generic_object_definitions","GET","expand=resources&limit=100","https://10.1.98.72/api/generic_object_definitions"
+    "groups","/api/groups","GET","expand=resources&limit=100","https://10.1.98.72/api/groups"
+    "instances","/api/instances","GET","expand=resources&limit=100","https://10.1.98.72/api/instances"
+    "network_routers","/api/network_routers","GET","expand=resources&limit=100","https://10.1.98.72/api/network_routers"
+    "notifications","/api/notifications","GET","expand=resources&limit=100","https://10.1.98.72/api/notifications"
+    "orchestration_stacks","/api/orchestration_stacks","GET","expand=resources&limit=100","https://10.1.98.72/api/orchestration_stacks"
+    "pictures","/api/pictures","GET","expand=resources&limit=100","https://10.1.98.72/api/pictures"
+    "policies","/api/policies","GET","expand=resources&limit=100","https://10.1.98.72/api/policies"
+    "policy_actions","/api/policy_actions","GET","expand=resources&limit=100","https://10.1.98.72/api/policy_actions"
+    "policy_profiles","/api/policy_profiles","GET","expand=resources&limit=100","https://10.1.98.72/api/policy_profiles"
+    "providers","/api/providers","GET","expand=resources&limit=100","https://10.1.98.72/api/providers"
+    "provision_dialogs","/api/provision_dialogs","GET","expand=resources&limit=100","https://10.1.98.72/api/provision_dialogs"
+    "provision_requests","/api/provision_requests","GET","expand=resources&limit=100","https://10.1.98.72/api/provision_requests"
+    "pxe_image_types","/api/pxe_image_types","GET","expand=resources&limit=100","https://10.1.98.72/api/pxe_image_types"
+    "rates","/api/rates","GET","expand=resources&limit=100","https://10.1.98.72/api/rates"
+    "regions","/api/regions","GET","expand=resources&limit=100","https://10.1.98.72/api/regions"
+    "reports","/api/reports","GET","expand=resources&limit=100","https://10.1.98.72/api/reports"
+    "request_tasks","/api/request_tasks","GET","expand=resources&limit=100","https://10.1.98.72/api/request_tasks"
+    "requests","/api/requests","GET","expand=resources&limit=100","https://10.1.98.72/api/requests"
+    "results","/api/results","GET","expand=resources&limit=100","https://10.1.98.72/api/results"
+    "roles","/api/roles","GET","expand=resources&limit=100","https://10.1.98.72/api/roles"
+    "search_filters","/api/search_filters","GET","expand=resources&limit=100","https://10.1.98.72/api/search_filters"
+    "security_groups","/api/security_groups","GET","expand=resources&limit=100","https://10.1.98.72/api/security_groups"
+    "servers","/api/servers","GET","expand=resources&limit=100","https://10.1.98.72/api/servers"
+    "service_catalogs","/api/service_catalogs","GET","expand=resources&limit=100","https://10.1.98.72/api/service_catalogs"
+    "service_dialogs","/api/service_dialogs","GET","expand=resources&limit=100","https://10.1.98.72/api/service_dialogs"
+    "service_orders","/api/ service_orders","GET","expand=resources&limit=100","https://10.1.98.72/api/service_orders"
+    "service_requests","/api/service_requests","GET","expand=resources&limit=100","https://10.1.98.72/api/service_requests"
+    "service_templates","/api/service_templates","GET","expand=resources&limit=100","https://10.1.98.72/api/service_templates"
+    "services","/api/services","GET","expand=resources&limit=100","https://10.1.98.72/api/services"
+    "settings","/api/settings","GET","expand=resources&limit=100","https://10.1.98.72/api/settings"
+    "shortcuts","/api/shortcuts","GET","expand=resources&limit=100","https://10.1.98.72/api/shortcuts"
+    "storage_services","/api/storage_services","GET","expand=resources&limit=100","https://10.1.98.72/api/storage_services"
+    "tags","/api/tags","GET","expand=resources&limit=100","https://10.1.98.72/api/tags"
+    "tasks","/api/tasks","GET","expand=resources&limit=100","https://10.1.98.72/api/tasks"
+    "templates","/api/templates","GET","expand=resources&limit=100","https://10.1.98.72/api/templates"
+    "tenants","/api/tenants","GET","expand=resources&limit=100","https://10.1.98.72/api/tenants"
+    "time_profiles","/api/time_profiles","GET","expand=resources&limit=100","https://10.1.98.72/api/time_profiles"
+    "users","/api/users","GET","expand=resources&limit=100","https://10.1.98.72/api/users"
+    "vms","/api/vms","GET","expand=resources&limit=100","https://10.1.98.72/api/vms"
+    "widgets","/api/widgets","GET","expand=resources&limit=100","https://10.1.98.72/api/widgets"
+    "zones","/api/zones","GET","expand=resources&limit=100","https://10.1.98.72/api/zones"
+
+---
+# 5. DEFINIZIONE DEL POD K6 (con variabili d'ambiente)
+apiversion: v1    
+kind: Pod
+metadata:
+  name: k6-stress-test
+  namespace: k6-tests
+  labels:
+    app: k6-stress
+spec:
+  containers:
+  - name: k6
+    image: grafana/k6:latest
+    command:
+      - k6
+      - run
+      - --out
+      - experimental-prometheus-rw
+      - /scripts/test.js
+    env:
+    # ========================================================
+    # CONFIGURAZIONE MANAGEIQ - MODIFICA SE NECESSARIO
+    # ========================================================
+    - name: MANAGEIQ_URL 
+      value: "https://10.1.98.72"  # CAMBIA QUI: Hostname o IP ManageIQ/LoadBalancer
+    - name: MIQ_USER
+      value: "admin"
+    - name: MIQ_PASS
+      value: "smartvm"  # Cambia se password diversa da "smartvm"
+    - name: K6_PROMETHEUS_RW_SERVER_URL
+      value: "http://8dcmp-mon-kube-prometheus-st-prometheus.monitoring.svc.cluster.local:9090/api/v1/write"  # CAMBIA: Service Prometheus (es: prometheus-operated, prometheus-server)
+    # Formato: http://SERVICE_NAME.NAMESPACE.svc.cluster.local:9090/api/v1/write
+    # Verifica con: kubectl get svc -n monitoring | grep prometheus
+    resources:
+      requests:
+        cpu: 1000m      #  1 CPU
+        memory: 1Gi     #  1GB RAM
+      limits:
+        cpu: 2000m      #  2 CPU
+        memory: 2Gi     #  2GB RAM
+    volumeMounts:
+    - name: k6-script
+      mountPath: /scripts
+    - name: csv-data
+      mountPath: /data 
+  volumes:
+  - name: k6-script
+    configMap:
+      name: k6-script-stress
+  - name: csv-data
+    configMap:
+      name: k6-csv-data-stress
+  restartPolicy: Never
