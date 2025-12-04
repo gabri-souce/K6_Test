@@ -13,8 +13,8 @@ Immediato:
 	1	Aumenta i threshold a valori più realistici
 	2	Isola i test di sicurezza in un test separato
 	3	Monitora specificamente gli endpoint lenti
-Nel tuo YAML (modifica rapida):
-yaml
+Nello YAML (modifica rapida):
+
 # Cambia nel ConfigMap del network-storage test:
 thresholds: {
   'http_req_duration{expected_response:true}': ['p(95)<2500'],  # Aumenta a 2.5s
