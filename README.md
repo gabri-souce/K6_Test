@@ -17,13 +17,13 @@
 kubectl apply -f k6-manageiq-total.yaml
 
 # Monitora
-kubectl logs -f k6-manageiq-cloud -n k6-tests
+kubectl logs -f k6-manageiq-total -n k6-tests
 ```
 ##  CLEANUP
 
 ```bash
 # Cancella test singolo
-kubectl delete pod k6-manageiq-cloud -n k6-tests
+kubectl delete pod k6-manageiq-total -n k6-tests
 
 # Cancella namespace
 kubectl delete namespace k6-tests

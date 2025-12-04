@@ -292,7 +292,8 @@ spec:
       value: "smartvm"  # Cambia se password diversa da "smartvm"
 #  IMPORTANTE: Verifica URL Prometheus corretto!
     - name: K6_PROMETHEUS_RW_SERVER_URL
-      value: "http://8dcmp-mon-kube-prometheus-st-prometheus.monitoring.svc.cluster.local:9090/api/v1/write"  # CAMBIA: Service Prometheus (es: prometheus-operated, prometheus-server)
+      value: "http://8dcmp-mon-kube-prometheus-st-prometheus.monitoring.svc.cluster.local:9090/api/v1/write"  
+    # CAMBIA: Service Prometheus (es: prometheus-operated, prometheus-server)
     # Formato: http://SERVICE_NAME.NAMESPACE.svc.cluster.local:9090/api/v1/write
     # Verifica con: kubectl get svc -n monitoring | grep prometheus
     resources:
